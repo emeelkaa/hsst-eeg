@@ -3,51 +3,45 @@ import pickle
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+from scipy.signal import resample
 
-
-class EEGDataset(Dataset):
-    def __init__(self, root: str, files: list):
+class CHBMITDataset(Dataset):
+    def __init__(self, root, files):
         self.root = root
         self.files = files
 
     def __len__(self):
         return len(self.files)
-    
-    def __getitem__(self, idx):
-        sample = pickle.load(open(os.path.join(self.root, self.files[idx]), 'rb'))
-        X = sample['X']
-        Y = sample['y']
+
+    def __getitem__(self, index):
+        with open(os.path.join(self.root, self.files[index]), "rb") as f:
+            sample = pickle.load(f)
+        X = sample["X"]
+        X = X / (np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True) + 1e-8)
+        Y = sample["y"]
         X = torch.FloatTensor(X)
+        Y = torch.tensor(Y, dtype=torch.long)
         return X, Y
-    
 
-def get_chbmit():
-    root = "chbmit/clean_segments_2"
-    train_files = os.listdir(os.path.join(root, "train"))
-    val_files = os.listdir(os.path.join(root, "val"))
-    test_files = os.listdir(os.path.join(root, "test"))
+class TUEVDataset(Dataset):
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 250
+        self.sampling_rate = sampling_rate
 
-    train_dataset = EEGDataset(os.path.join(root, "train"), train_files)
-    val_dataset = EEGDataset(os.path.join(root, "val"), val_files)
-    test_dataset = EEGDataset(os.path.join(root, "test"), test_files)
+    def __len__(self):
+        return len(self.files)
 
-    return train_dataset, val_dataset, test_dataset
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["signal"]
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, 5 * self.sampling_rate, axis=-1)
+        X = X / (np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)+ 1e-8)
+        Y = int(sample["label"][0] - 1)
+        X = torch.FloatTensor(X)
+        Y = torch.tensor(Y, dtype=torch.long)
+        return X, Y
 
 
-def get_tuev():
-    root = "tuev"
-    train_files = os.listdir(os.path.join(root, "processed_train"))
-    train_sub = list(set([f.split("_")[0] for f in train_files]))
-    print("train sub", len(train_sub))
-    test_files = os.listdir(os.path.join(root, "processed_eval"))
-
-    val_sub = np.random.choice(train_sub, size=int(
-        len(train_sub) * 0.1), replace=False)
-    train_sub = list(set(train_sub) - set(val_sub))
-    val_files = [f for f in train_files if f.split("_")[0] in val_sub]
-    train_files = [f for f in train_files if f.split("_")[0] in train_sub]
-
-    train_dataset = EEGDataset(os.path.join(root, "processed_train"), train_files)
-    val_dataset = EEGDataset(os.path.join(root, "processed_train"), val_files)
-    test_dataset = EEGDataset(os.path.join(root, "processed_eval"), test_files)
-    return train_dataset, val_dataset, test_dataset

@@ -1,142 +1,102 @@
+
+import math
 import torch
 import torch.nn as nn
-from einops import rearrange
-from einops.layers.torch import Rearrange, Reduce
+import torch.nn.functional as F
 from mamba_ssm import Mamba
+from linear_attention_transformer import LinearAttentionTransformer
+from einops import rearrange
+from einops.layers.torch import Reduce
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, emb_size, drop_p=0.1, max_len=1024):
+        super().__init__()
+        self.dropout = nn.Dropout(p=drop_p)
 
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, emb_size)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, emb_size, 2).float() * -(math.log(10000.0) / emb_size))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)
+    
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 40, num_channels: int = 16):
+    def __init__(self, emb_size, num_channels, n_fft, hop_length):
         super().__init__()
-        self.emb_size = emb_size
+        self.n_fft = n_fft 
+        self.hop_length = hop_length
+        self.segment_emb = nn.Linear((n_fft // 2 + 1), emb_size)
 
-        self.shallownet = nn.Sequential(
-            nn.Conv2d(1, emb_size, (1, 25), (1, 1)),
-            nn.Conv2d(emb_size, emb_size, (num_channels, 1), (1, 1)),
-            nn.BatchNorm2d(emb_size),
-            nn.ELU(),
-            nn.AvgPool2d((1, 75), (1, 15)),
-            nn.Dropout(0.5),
+        self.position_emb = PositionalEncoding(emb_size)
+        self.channel_emb = nn.Embedding(num_channels, emb_size)
+        self.index = nn.Parameter(torch.LongTensor(range(num_channels)), requires_grad=False)
+
+        self.register_buffer('window', torch.hann_window(n_fft))
+    
+    def stft(self, x):
+        x_flat = rearrange(x, 'b c t -> (b c) t')
+        spectral = torch.stft( 
+            input = x_flat,
+            n_fft = self.n_fft,
+            hop_length = self.hop_length,
+            window=self.window,
+            center = False,
+            onesided = True,
+            return_complex = True,
         )
+        return torch.abs(spectral)
 
-        self.projection = nn.Sequential(
-            nn.Conv2d(emb_size, emb_size, (1, 1), stride=(1, 1)), 
-            Rearrange('b e (h) (w) -> b (h w) e'),
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.shallownet(x)
-        x = self.projection(x)
-        return x
-    
+    def forward(self, x):
+        B, C, T = x.shape
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, drop_p: float):
+        emb = self.stft(x)
+        emb = self.segment_emb(rearrange(emb, 'B D T -> B T D'))
+        emb = rearrange(emb, '(B C) T D -> B C T D', B=B, C=C)
+
+        ch_emb = self.channel_emb(self.index)
+        ch_emb = ch_emb[None, :, None, :].expand(B, -1, emb.shape[2], -1)
+        emb = emb + ch_emb
+        emb = self.position_emb(rearrange(emb, 'b c t d -> (b c) t d'))
+
+        return emb
+
+class MambaBlock(nn.Module):
+    def __init__(self, emb_size, d_state=32, d_conv=4, dropout=0.2):
         super().__init__()
-        self.emb_size = emb_size
-        self.num_heads = num_heads
-        self.keys = nn.Linear(emb_size, emb_size)
-        self.queries = nn.Linear(emb_size, emb_size)
-        self.values = nn.Linear(emb_size, emb_size)
-        self.att_drop = nn.Dropout(drop_p)
-        self.projection = nn.Linear(emb_size, emb_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        queries = rearrange(self.queries(x), "b n (h d) -> b h n d", h=self.num_heads)
-        keys = rearrange(self.keys(x), "b n (h d) -> b h n d", h=self.num_heads)
-        values = rearrange(self.values(x), "b n (h d) -> b h n d", h=self.num_heads)
+        self.mamba_fwd = Mamba(d_model=emb_size, d_state=d_state, d_conv=d_conv)
+        self.mamba_rev = Mamba(d_model=emb_size, d_state=d_state, d_conv=d_conv)
 
-        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys) 
+        self.ln1 = nn.LayerNorm(emb_size)
+        self.ln2 = nn.LayerNorm(emb_size)
+        self.ln1_rev = nn.LayerNorm(emb_size)
+        self.ln2_rev = nn.LayerNorm(emb_size)
 
-        scaling = self.emb_size ** (1 / 2)
-        att = torch.nn.functional.softmax(energy / scaling, dim=-1)
-        att = self.att_drop(att)
-        out = torch.einsum('bhal, bhlv -> bhav ', att, values)
-        out = rearrange(out, "b h n d -> b n (h d)")
-        out = self.projection(out)
-        return out
-
-
-class ResidualAdd(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        res = x
-        x = self.fn(x, **kwargs)
-        x += res
-        return x
-    
-
-class FeedForwardBlock(nn.Sequential):
-    def __init__(self, emb_size: int, expansion: int, drop_p: float):
-        super().__init__(
-            nn.Linear(emb_size, expansion * emb_size),
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_size, emb_size * 4),
             nn.GELU(),
-            nn.Dropout(drop_p),
-            nn.Linear(expansion * emb_size, emb_size),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size * 4, emb_size),
         )
 
-
-class TransformerEncoderBlock(nn.Sequential):
-    def __init__(self, emb_size: int, num_heads: int, drop_p: float = 0.5, forward_expansion: int = 4, forward_drop_p: float = 0.3):
-        super().__init__(
-            ResidualAdd(nn.Sequential(
-                nn.LayerNorm(emb_size),
-                MultiHeadAttention(emb_size, num_heads, drop_p),
-                nn.Dropout(drop_p)
-            )),
-            ResidualAdd(nn.Sequential(
-                nn.LayerNorm(emb_size),
-                FeedForwardBlock(
-                    emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
-                nn.Dropout(drop_p)
-            )
-            ))
-
-
-class TransformerEncoder(nn.Sequential):
-    def __init__(self, depth: int, emb_size: int, num_heads: int):
-        super().__init__(*[TransformerEncoderBlock(emb_size, num_heads) for _ in range(depth)])
-
-
-class BiMambaBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int = 16,
-        d_conv: int = 4,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-
-        self.mamba_fwd = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv
+        self.ffn_rev = nn.Sequential(
+            nn.Linear(emb_size, emb_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size * 4, emb_size),
         )
-
-        self.mamba_rev = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv
-        )
-
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ln1_rev = nn.LayerNorm(d_model)
-        self.ln2_rev = nn.LayerNorm(d_model)
-
-
-        self.ffn = FeedForwardBlock(d_model, 4, dropout)
-        self.ffn_rev = FeedForwardBlock(d_model, 4, dropout)
-
+        
         self.dropout = nn.Dropout(dropout)
 
     def forward_branch(self, x, mamba, ln1, ln2, ffn, flip_time=False):
         if flip_time:
-            x_in = torch.flip(x, dims=[1])  # (B, S, D)
+            x_in = torch.flip(x, dims=[1])
         else:
             x_in = x
 
@@ -157,129 +117,42 @@ class BiMambaBlock(nn.Module):
         out_fwd = self.forward_branch(
             x, self.mamba_fwd, self.ln1, self.ln2, self.ffn, flip_time=False
         )
-
+        
         out_rev = self.forward_branch(
             x, self.mamba_rev, self.ln1_rev, self.ln2_rev, self.ffn_rev, flip_time=True
         )
 
-        out = 0.5 * (out_fwd + out_rev) 
+        out = 0.5 * (out_fwd + out_rev)
         return out
-
-
-class BiMambaEncoder(nn.Module):
-    def __init__(self, d_model: int, num_layers: int, **block_kwargs):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [BiMambaBlock(d_model=d_model, **block_kwargs) for _ in range(num_layers)]
-        )
-        self.final_ln = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return self.final_ln(x)
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, drop_p: float):
-        super().__init__()
-        self.emb_size = emb_size
-        self.num_heads = num_heads
-
-        self.keys = nn.Linear(emb_size, emb_size)
-        self.values = nn.Linear(emb_size, emb_size)
-        self.queries = nn.Linear(emb_size, emb_size)
-
-        self.att_drop = nn.Dropout(drop_p)
-        self.projection = nn.Linear(emb_size, emb_size)
-
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-
-        queries = rearrange(self.queries(x), "b n (h d) -> b h n d", h=self.num_heads)
-        # Keys and values from source/context sequence
-        keys = rearrange(self.keys(context), "b n (h d) -> b h n d", h=self.num_heads)
-        values = rearrange(self.values(context), "b n (h d) -> b h n d", h=self.num_heads)
-
-        # Attention: target attends to source
-        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys)
-                
-        scaling = self.emb_size ** (1 / 2)
-        att = torch.nn.functional.softmax(energy / scaling, dim=-1)
-        att = self.att_drop(att)
-        
-        # Weighted sum of values
-        out = torch.einsum('bhal, bhlv -> bhav', att, values)
-        out = rearrange(out, "b h n d -> b n (h d)")
-        out = self.projection(out)
-        return out
-
-class FusionLayer(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, drop_p: float):
-        super().__init__()
-        self.emb_size = emb_size
-        self.num_heads = num_heads
-        self.att_norm = nn.LayerNorm(emb_size)
-        self.att = CrossAttention(emb_size, num_heads, drop_p=0.5)
-        self.att_dropout = nn.Dropout(drop_p)
-        self.ffn_norm = nn.LayerNorm(emb_size)
-        self.ffn = FeedForwardBlock(emb_size, expansion=4, drop_p=0.3)
-        self.ffn_dropout = nn.Dropout(drop_p)
     
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = self.att_norm(x)
-        x = self.att(x, context)
-        x = self.att_dropout(x)
-        x = self.ffn_norm(x)
-        x = self.ffn(x)
-        x = self.ffn_dropout(x)
-        return x
-
-
-
-class ClassificationHead(nn.Sequential):
-    def __init__(self, emb_size: int, n_classes: int):
+class HSST(nn.Module):
+    def __init__(self, emb_size, depth, num_heads, num_channels, num_classes, n_fft=200, hop_length=100):
         super().__init__()
-        
-        self.clshead = nn.Sequential(
+        self.patch_embedding = PatchEmbedding(emb_size, num_channels, n_fft, hop_length)
+
+        self.attention = LinearAttentionTransformer(
+            dim=emb_size,
+            heads=num_heads,
+            depth=2,
+            max_seq_len=1024,
+            attn_layer_dropout=0.2,  
+            attn_dropout=0.2,
+        )
+
+        self.mamba = nn.ModuleList([
+            MambaBlock(emb_size) for _ in range(2)
+        ])
+        self.cls_head = nn.Sequential(
             Reduce('b n e -> b e', reduction='mean'),
             nn.LayerNorm(emb_size),
-            nn.Linear(emb_size, n_classes)
+            nn.Linear(emb_size, num_classes)
         )
-
-    def forward(self, x):
-        out = self.clshead(x)
-        return out
-
-
-class HSST(nn.Module):
-    def __init__(self, emb_size: int = 40, depth: int = 2, num_heads: int = 4, n_channels: int = 18, n_classes: int = 1):
-        super().__init__()
-        self.patch_embedding = PatchEmbedding(emb_size, n_channels)
-        self.transformer = TransformerEncoder(depth, emb_size, num_heads)
-        self.mamba = BiMambaEncoder(emb_size, depth)
-        self.fusion = FusionLayer(emb_size, num_heads, drop_p=0.3)
-        self.clshead = ClassificationHead(emb_size, n_classes)
     
     def forward(self, x):
-        x = torch.unsqueeze(x, dim=1)
-        emb = self.patch_embedding(x)
-        transformer_out = self.transformer(emb)
-        mamba_out = self.mamba(emb)
-        fusion_out = self.fusion(transformer_out, mamba_out)
-        fusion_out += mamba_out
-        out = self.clshead(fusion_out)
+        f_e = self.patch_embedding(x)
+        for mamba in self.mamba:
+            f_e = mamba(f_e)
+        f_e = rearrange(f_e, '(b c) t d -> b (c t) d', b=x.shape[0])
+        f_e = self.attention(f_e)
+        out = self.cls_head(f_e)
         return out
-    
-
-if __name__ == '__main__':
-    import time
-    model = HSST(emb_size=40, depth=4, num_heads=4, n_channels=18, n_classes=1).to('cuda')
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters: {num_params}")
-    sample = torch.randn(1, 18, 2560).to('cuda')
-    t0 = time.time()
-    out = model(sample)
-    t1 = time.time()
-    print(f"Inference time: {t1 - t0} seconds")
-    print(f"Output shape: {out.shape}")
-    

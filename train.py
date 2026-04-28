@@ -1,73 +1,58 @@
 import os
 import json
-import torch
-import logging
-from torch.utils.data import Dataset, DataLoader
+import time
 import numpy as np
-from pyhealth.metrics import binary_metrics_fn
-from pyhealth.metrics import multiclass_metrics_fn
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
+from dataset import CHBMITDataset, TUEVDataset
+from models import SPaRCNet, TSception, Conformer, BIOTClassifier, HSST
+import utils
 
-from dataset import get_chbmit, get_tuev
-from models import EEGConformer, BIOT, HSST, SPARCNet, TSception
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+class Trainer:
+    def __init__(self, model, train_dataset, val_dataset, test_dataset,
+                 num_classes, batch_size, save_dir, class_counts=None,
+                 num_workers=2, lr=3e-4, weight_decay=1e-4):
 
-class Trainer: 
-    def __init__(self, model: torch.nn.Module, train_dataset: Dataset, val_dataset: Dataset, test_dataset: Dataset, num_classes: int, 
-                 batch_size: int, num_workers: int, lr: float = 1e-3, weight_decay: float = 1e-4, save_dir: str = "results", seed: int = 42
-    ):
-        # Set seeds for reproducibility
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_classes = num_classes
         self.save_dir = save_dir
         os.makedirs(self.save_dir, exist_ok=True)
 
-        self.train_loader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
-        self.val_loader = DataLoader(val_dataset, shuffle=False, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
-        self.test_loader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size, pin_memory=True, num_workers=num_workers)
+        self.train_loader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size,
+                                       pin_memory=True, num_workers=num_workers)
+        self.val_loader = DataLoader(val_dataset, shuffle=False, batch_size=batch_size,
+                                     pin_memory=True, num_workers=num_workers)
+        self.test_loader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size,
+                                      pin_memory=True, num_workers=num_workers)
 
         self.model = model.to(self.device)
 
         if self.num_classes == 1:
-            self.criterion = torch.nn.BCEWithLogitsLoss()
+            pos_weight = (class_counts[0] / class_counts[1]).to(self.device)
+            print(f"[Loss] pos_weight = {pos_weight:.2f}  "
+                  f"(non-seizure: {int(class_counts[0])}, seizure: {int(class_counts[1])})")
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
         else:
-            self.criterion = torch.nn.CrossEntropyLoss()
+            class_weights = (1.0 / class_counts)
+            class_weights = (class_weights / class_weights.sum() * len(class_counts)).to(self.device)
+            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3)
 
-        if self.num_classes == 1:
-            self.history = {
-                'train_loss': [], 'train_acc': [], 'train_bacc': [], 'train_pr_auc': [], 'train_auroc': [],
-                'val_loss': [], 'val_acc': [], 'val_bacc': [], 'val_pr_auc': [], 'val_auroc': []
-            }
-        else:
-            self.history = {
-                'train_loss': [], 'train_bacc': [], 'train_f1': [], 'train_kappa': [],
-                'val_loss': [], 'val_bacc': [], 'val_f1': [], 'val_kappa': []
-            }
-
-    def compute_metrics(self, labels, probs):
-        if self.num_classes == 1:
-            metrics = binary_metrics_fn(labels, probs, metrics=['accuracy', 'balanced_accuracy', 'pr_auc', 'roc_auc'])
-            return metrics['accuracy'], metrics['balanced_accuracy'], metrics['pr_auc'], metrics['roc_auc']
-        else:
-            metrics = multiclass_metrics_fn(labels, probs, metrics=['balanced_accuracy', 'f1_weighted', 'cohen_kappa'])
-            return metrics['balanced_accuracy'], metrics['f1_weighted'], metrics['cohen_kappa']
-
-    def save_history(self):
-        with open(os.path.join(self.save_dir, 'history.json'), 'w') as f:
-            json.dump(self.history, f, indent=4)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.75, patience=5, verbose=True
+        )
 
     def step(self, batch, training=True):
         inputs, labels = [x.to(self.device) for x in batch]
-        
+
         if training:
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -77,193 +62,281 @@ class Trainer:
             logits = outputs.squeeze(-1)
             loss = self.criterion(logits, labels.float())
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
+            preds = (probs >= 0.5).long()
         else:
             loss = self.criterion(outputs, labels)
             probs = torch.softmax(outputs, dim=-1)
             preds = torch.argmax(probs, dim=-1)
 
-        if training: 
+        if training:
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
-        
-        correct = (preds == labels).sum().item()
-        return loss.item(), correct, probs, labels
-    
 
+        return loss.item(), probs, preds, labels
+
+    # ── Full pass over a dataloader ───────────────────────────────────────────
     def evaluate(self, dataloader, training=True):
-        if training: 
+        if training:
             self.model.train()
         else:
             self.model.eval()
 
-        total_loss, total_correct, total_samples  = 0.0, 0, 0
-        probs_list, labels_list = [], []
+        total_loss, total_samples = 0.0, 0
+        probs_list, preds_list, labels_list = [], [], []
 
         with torch.set_grad_enabled(training):
-            for batch in tqdm(dataloader, desc="Training" if training else "Evaluating"):
-                loss, correct, probs, labels = self.step(batch, training)
+            for batch in tqdm(dataloader, desc="Train" if training else "Eval"):
+                loss, probs, preds, labels = self.step(batch, training)
                 batch_size = labels.size(0)
 
                 total_loss += loss * batch_size
-                total_correct += correct
                 total_samples += batch_size
 
                 probs_list.append(probs.detach().cpu())
+                preds_list.append(preds.detach().cpu())
                 labels_list.append(labels.detach().cpu())
-        
-        avg_loss = total_loss / total_samples
 
-        all_probs = torch.cat(probs_list).numpy()
+        avg_loss = total_loss / total_samples
         all_labels = torch.cat(labels_list).numpy()
+        all_probs  = torch.cat(probs_list).numpy()
+        all_preds  = torch.cat(preds_list).numpy()
 
         if self.num_classes == 1:
-            acc, balanced_acc, pr_auc, auroc = self.compute_metrics(all_labels, all_probs)
-            return avg_loss, acc, balanced_acc, pr_auc, auroc
+            acc, balanced_acc, auroc, precision, recall = utils.compute_metrics(
+                self.num_classes, all_labels, all_probs, all_preds)
+            metrics = {'loss': avg_loss, 'acc': acc, 'bacc': balanced_acc,
+                       'auroc': auroc, 'precision': precision, 'recall': recall}
         else:
-            balanced_acc, f1, kappa = self.compute_metrics(all_labels, all_probs)
-            return avg_loss, balanced_acc, f1, kappa
-            
+            acc, balanced_acc, f1, kappa = utils.compute_metrics(
+                self.num_classes, all_labels, all_probs, all_preds)
+            metrics = {'loss': avg_loss, 'acc': acc, 'bacc': balanced_acc,
+                       'f1': f1, 'kappa': kappa}
 
-    def train(self, epochs, patience):
-        model_path = os.path.join(self.save_dir, 'best_model.pth') 
-        best_loss, patience_counter = float('inf'), 0
+        return metrics, all_probs, all_preds, all_labels
+
+    def train(self, epochs, patience=15):
+        model_path = os.path.join(self.save_dir, 'best_model.pth')
+        best_bacc = -np.inf
+        patience_counter = 0
 
         for epoch in range(epochs):
+            train_metrics, _, _, _ = self.evaluate(self.train_loader, training=True)
+
+            val_metrics, val_probs, _, val_labels = self.evaluate(self.val_loader, training=False)
+
+            self.scheduler.step(val_metrics['bacc'])
+
             if self.num_classes == 1:
-                train_loss, train_acc, train_bacc, train_pr_auc, train_auroc = self.evaluate(self.train_loader, training=True)
-                val_loss, val_acc, val_bacc, val_pr_auc, val_auroc = self.evaluate(self.val_loader, training=False)
-
-                self.scheduler.step(val_loss)
-
-                for key, val in zip(['train_loss', 'train_acc', 'train_bacc', 'train_pr_auc', 'train_auroc',
-                                    'val_loss', 'val_acc', 'val_bacc', 'val_pr_auc', 'val_auroc'],
-                                    [train_loss, train_acc, train_bacc, train_pr_auc, train_auroc,
-                                    val_loss, val_acc, val_bacc, val_pr_auc, val_auroc]):
-                    self.history[key].append(val)
-                
-                logging.info(f"Epoch {epoch+1}/{epochs}"
-                            f"\nTrain - Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%, BAcc: {train_bacc:.2f}%"
-                            f"\nAUROC: {train_auroc:.4f}, PR-AUC: {train_pr_auc:.4f}"
-                            f"\nVal - Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%, BAcc: {val_bacc:.2f}%"
-                            f"\nAUROC: {val_auroc:.4f}, PR-AUC: {val_pr_auc:.4f}")
-
-                self.save_history()
-            
+                print(f"Epoch {epoch+1}/{epochs}"
+                      f"\n  Train — Loss: {train_metrics['loss']:.4f}  BAcc: {train_metrics['bacc']:.4f}  AUROC: {train_metrics['auroc']:.4f}"
+                      f"\n  Val   — Loss: {val_metrics['loss']:.4f}  BAcc: {val_metrics['bacc']:.4f}  AUROC: {val_metrics['auroc']:.4f}")
             else:
-                train_loss, train_bacc, train_f1, train_kappa = self.evaluate(self.train_loader, training=True)
-                val_loss, val_bacc, val_f1, val_kappa = self.evaluate(self.val_loader, training=False)
+                print(f"Epoch {epoch+1}/{epochs}"
+                      f"\n  Train — Loss: {train_metrics['loss']:.4f}  BAcc: {train_metrics['bacc']:.4f}  F1: {train_metrics['f1']:.4f}"
+                      f"\n  Val   — Loss: {val_metrics['loss']:.4f}  BAcc: {val_metrics['bacc']:.4f}  F1: {val_metrics['f1']:.4f}")
 
-                self.scheduler.step(val_loss)
-
-                for key, val in zip(['train_loss', 'train_bacc', 'train_f1', 'train_kappa',
-                                    'val_loss', 'val_bacc', 'val_f1', 'val_kappa'],
-                                    [train_loss, train_bacc, train_f1, train_kappa,
-                                    val_loss, val_bacc, val_f1, val_kappa]):
-                    self.history[key].append(val)
-                
-                logging.info(f"Epoch {epoch+1}/{epochs}"
-                            f"\nTrain - Loss: {train_loss:.4f}, BACC: {train_bacc:.2f}%, F1: {train_f1:.2f}%, Kappa: {train_kappa:.2f}" 
-                            f"\nVal - Loss: {val_loss:.4f}, BACC: {val_bacc:.2f}%, F1: {val_f1:.2f}%, Kappa: {val_kappa:.2f}"
-                )
-
-                self.save_history()
-
-            if val_loss < best_loss:
-                best_loss = val_loss
-                patience_counter = 0
+            if val_metrics['bacc'] > best_bacc:
+                best_bacc = val_metrics['bacc']
                 torch.save(self.model.state_dict(), model_path)
-                logging.info(f"Best model saved with val loss: {best_loss:.4f}")
+                print(f"Best model saved with: {val_metrics['bacc']:.4f}")
+                patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    logging.info(f"Early stopping at epoch {epoch+1}")
+                    print("Early stopping triggered")
                     break
 
-    
+            log_stats = {**{f'train_{k}': float(v) for k, v in train_metrics.items()},
+                         **{f'val_{k}': float(v) for k, v in val_metrics.items()},
+                         'epoch': epoch}
+            with open(os.path.join(self.save_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
     def test(self):
         model_path = os.path.join(self.save_dir, 'best_model.pth')
         self.model.load_state_dict(torch.load(model_path))
 
+        test_metrics, _, all_preds, all_labels = self.evaluate(
+            self.test_loader, training=False)
+
         if self.num_classes == 1:
-            test_loss, test_acc, test_bacc, test_pr_auc, test_auroc = self.evaluate(self.test_loader, training=False)
-            logging.info(f"Test - Loss: {test_loss:.4f}, Acc: {test_acc:.2f}%, BAcc: {test_bacc:.2f}%"
-                    f"\nAUROC: {test_auroc:.4f}, PR-AUC: {test_pr_auc:.4f}")
-            
-            test_metrics = {
-            'test_loss': test_loss,
-            'test_acc': test_acc,
-            'test_bacc': test_bacc,
-            'test_pr_auc': test_pr_auc,
-            'test_auroc': test_auroc,
-            }
+            print(f"\nTest — Loss: {test_metrics['loss']:.4f}  Acc: {test_metrics['acc']:.4f}"
+                  f"  BAcc: {test_metrics['bacc']:.4f}"
+                  f"\n       AUROC: {test_metrics['auroc']:.4f}  "
+                  f"Prec: {test_metrics['precision']:.4f}  Rec: {test_metrics['recall']:.4f}")
         else:
-            test_loss, test_bacc, test_f1, test_kappa = self.evaluate(self.test_loader, training=False)
-            logging.info(f"Test - Loss: {test_loss:.4f}, BACC: {test_bacc:.2f}%, F1: {test_f1:.2f}%, Kappa: {test_kappa:.2f}"
-            )
-            
-            test_metrics = {
-            'test_loss': test_loss,
-            'test_bacc': test_bacc,
-            'test_f1': test_f1,
-            'test_kappa': test_kappa,            
-            }
+            print(f"\nTest — Loss: {test_metrics['loss']:.4f}  Acc: {test_metrics['acc']:.4f}"
+                  f"  BAcc: {test_metrics['bacc']:.4f}"
+                  f"\n       F1: {test_metrics['f1']:.4f}  Kappa: {test_metrics['kappa']:.4f}")
 
         with open(os.path.join(self.save_dir, 'test_metrics.json'), 'w') as f:
             json.dump(test_metrics, f, indent=4)
 
+        if self.num_classes > 1:
+            tuev_classes = ['SPSW', 'GPED', 'PLED', 'EYEM', 'ARTF', 'BCKG']
+            class_names = tuev_classes if self.num_classes == 6 else None
+            self.save_confusion_matrix(all_preds, all_labels, class_names)
 
+        return test_metrics
+
+    # ── Confusion matrix ──────────────────────────────────────────────────────
+    def save_confusion_matrix(self, all_preds, all_labels, class_names=None):
+        cm = confusion_matrix(all_labels, all_preds)
+        cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        for ax, data, fmt, title in zip(
+            axes,
+            [cm, cm_norm],
+            ['d', '.2f'],
+            ['Confusion Matrix (counts)', 'Confusion Matrix (normalised)']
+        ):
+            sns.heatmap(data, annot=True, fmt=fmt, cmap='Blues', ax=ax,
+                        xticklabels=class_names, yticklabels=class_names)
+            ax.set_xlabel('Predicted')
+            ax.set_ylabel('True')
+            ax.set_title(title)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, 'confusion_matrix.png'), dpi=150)
+        plt.close(fig)
+
+
+def get_dataset(dataset='tuev', verbose=True):
+    if dataset == 'tuev':
+        root = "../../data/tuev/edf"
+        train_files = sorted(os.listdir(os.path.join(root, "processed_train")))
+        train_sub = sorted(set([f.split("_")[0] for f in train_files]))
+        val_sub = np.random.choice(train_sub, size=int(len(train_sub) * 0.1), replace=False)
+        train_sub = sorted(set(train_sub) - set(val_sub))
+
+        val_files   = [f for f in train_files if f.split("_")[0] in val_sub]
+        train_files = [f for f in train_files if f.split("_")[0] in train_sub]
+        test_files  = sorted(os.listdir(os.path.join(root, "processed_eval")))
+
+        train_dataset = TUEVDataset(os.path.join(root, "processed_train"), train_files, 250)
+        val_dataset   = TUEVDataset(os.path.join(root, "processed_train"), val_files,   250)
+        test_dataset  = TUEVDataset(os.path.join(root, "processed_eval"),  test_files,  250)
+
+        num_channels, num_times, sfreq, num_classes = 16, 1250, 250, 6
+
+        train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
+        class_counts = torch.zeros(num_classes)
+        for label in train_labels:
+            class_counts[int(label)] += 1
+
+    elif dataset == 'chbmit':
+        root = "../../data/chbmit/clean_segments"
+        train_files = sorted(os.listdir(os.path.join(root, "train")))
+        val_files   = sorted(os.listdir(os.path.join(root, "val")))
+        test_files  = sorted(os.listdir(os.path.join(root, "test")))
+
+        train_dataset = CHBMITDataset(os.path.join(root, "train"), train_files)
+        val_dataset   = CHBMITDataset(os.path.join(root, "val"),   val_files)
+        test_dataset  = CHBMITDataset(os.path.join(root, "test"),  test_files)
+        num_channels, num_times, sfreq, num_classes = 16, 2000, 200, 1
+
+        class_counts = torch.tensor([49816, 1913], dtype=torch.float)
+        print(f"[Dataset] class_counts — 0: {class_counts[0]}  1: {class_counts[1]}")
+        print("          Confirm: label 0 = non-seizure, label 1 = seizure")
+
+    if verbose:
+        print(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
+
+    return train_dataset, val_dataset, test_dataset, num_channels, num_times, sfreq, num_classes, class_counts
+
+def get_model(model_name, num_channels, num_times, num_classes, sfreq,
+              emb_size, depth, num_heads):
+    if model_name == 'sparcnet':
+        return SPaRCNet(num_channels=num_channels, num_timepoints=num_times,
+                        num_classes=num_classes)
+    elif model_name == 'tsception':
+        return TSception(num_channels=num_channels, sfreq=sfreq,
+                         num_classes=num_classes)
+    elif model_name == 'conformer':
+        return Conformer(emb_size=emb_size, depth=depth, num_heads=num_heads,
+                         num_classes=num_classes, num_channels=num_channels)
+    elif model_name == 'biot':
+        return BIOTClassifier(emb_size=emb_size, depth=depth, num_heads=num_heads,
+                              num_classes=num_classes, num_channels=num_channels,
+                              n_fft=sfreq, hop_length=sfreq // 2)
+    elif model_name == 'hsst':
+        return HSST(emb_size=emb_size, depth=depth, num_heads=num_heads,
+                    num_classes=num_classes, num_channels=num_channels)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = True
 
 if __name__ == "__main__":
-    datasets = ['chbmit_2']
-    
-    for dataset in datasets:
-        if dataset == 'chbmit_2':
-            train_dataset, val_dataset, test_dataset = get_chbmit()
+    dataset_name = 'tuev'
+    model_name   = 'hsst'
+    emb_size     = 64
+    depth        = 6
+    num_heads    = 4
+    batch_size   = 32
+    num_workers  = 2
 
-            n_channels = 16
-            n_times = 2560
-            sfreq = 256
-            n_classes = 1
-        elif dataset == 'tuev':
-            train_dataset, val_dataset, test_dataset = get_tuev()
+    if dataset_name == 'tuev':
+        seeds = [1, 42, 100, 1000, 12345]
+        start_time = time.time()
+        for seed in seeds:
+            set_seed(seed)
+            (train_dataset, val_dataset, test_dataset,
+             num_channels, num_times, sfreq,
+             num_classes, class_counts) = get_dataset(dataset_name, verbose=True)
 
-            n_channels = 16
-            n_times = 1250 
-            sfreq = 250
-            n_classes = 6
-      
-        models = ['biot', 'conformer', 'hsst', 'sparcnet', 'tsception']
-        emb_size = 64
-        num_heads = 4
-        depth = 2
+            model = get_model(model_name, num_channels, num_times, num_classes,
+                              sfreq, emb_size, depth, num_heads)
 
-        for i, model_name in enumerate(models):
-            if model_name == 'conformer':
-                model = EEGConformer(emb_size=emb_size, depth=depth, num_heads=num_heads, n_channels=n_channels, n_classes=n_classes)
-            elif model_name == 'biot':
-                model = BIOT(emb_size=emb_size, depth=depth, num_heads=num_heads, n_channels=n_channels, n_classes=n_classes)
-            elif model_name == 'hsst':
-                model = HSST(emb_size=emb_size, depth=depth//2, num_heads=num_heads, n_channels=n_channels, n_classes=n_classes)
-            elif model_name == 'sparcnet':
-                model = SPARCNet(num_channels=n_channels, num_times=n_times, num_classes=n_classes)
-            elif model_name == 'tsception':
-                model = TSception(num_classes=n_classes, input_size=(1, n_channels, n_times), sampling_rate=sfreq, num_T=32, num_S=32, hidden=64, dropout_rate=0.3)
-            
-            seeds = [1234]
+            trainer = Trainer(
+                model=model,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                test_dataset=test_dataset,
+                batch_size=batch_size,
+                num_classes=num_classes,
+                num_workers=num_workers,
+                save_dir=f"outputs/{dataset_name}/{model_name}/{seed}/",
+                class_counts=class_counts,
+            )
+            trainer.train(epochs=50, patience=10)
+            test_metrics = trainer.test()
+            print(f"Seed {seed}: {test_metrics}")
 
+        print(f"Done in {time.time() - start_time:.1f}s")
+
+    elif dataset_name == 'chbmit':
+        seeds = [42, 100, 12345]
+        models = ['sparcnet', 'tsception', 'conformer', 'biot', 'hsst']
+        start_time = time.time()
+        for model_name in models:
             for seed in seeds:
+                set_seed(seed)
+                (train_dataset, val_dataset, test_dataset,
+                num_channels, num_times, sfreq,
+                num_classes, class_counts) = get_dataset(dataset_name, verbose=True)
+
+                model = get_model(model_name, num_channels, num_times, num_classes,
+                                    sfreq, emb_size, depth, num_heads)
+
                 trainer = Trainer(
                     model=model,
                     train_dataset=train_dataset,
                     val_dataset=val_dataset,
                     test_dataset=test_dataset,
-                    batch_size=16,
-                    num_classes=n_classes,
-                    num_workers=2,
-                    save_dir=f"results/{dataset}/{model_name}/{seed}",
-                    seed=seed 
+                    batch_size=batch_size,
+                    num_classes=num_classes,
+                    num_workers=num_workers,
+                    save_dir=f"outputs/{dataset_name}/{model_name}/{seed}/",
+                    class_counts=class_counts,
                 )
-
-                trainer.train(epochs=100, patience=10)
-                trainer.test()
+                trainer.train(epochs=50, patience=10) 
+                test_metrics = trainer.test()
+                print(f"Test: {test_metrics}")

@@ -1,5 +1,5 @@
-from .biot import BIOT
-from .eeg_conformer import EEGConformer, TransformerEncoder
-from .hsstv2 import HSST
-from .sparcnet import SPARCNet
+from .sparcnet import SPaRCNet
 from .tsception import TSception
+from .biot import BIOTClassifier
+from .hsst import HSST
+from .conformer import Conformer
