@@ -1,7 +1,5 @@
 # HSST-EEG [IEEE Access 2026]
 
----
-
 ## 📂 Repository Structure
 ```
 CGM-EEG/
