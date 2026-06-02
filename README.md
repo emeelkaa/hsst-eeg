@@ -1,4 +1,4 @@
-# HSST-EEG
+# HSST-EEG [IEEE Access 2026]
 
 This repository contains code for **HSST-EEG**,  
 a hybrid mamba-transformer framework for EEG analysis.  
