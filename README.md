@@ -1,8 +1,10 @@
-# HSST-EEG [IEEE Access 2026]
+# 🧠 HSST-EEG [IEEE Access 2026]
+[![Paper](https://img.shields.io/badge/ISBI%202026-Oral-blue)](https://ieeexplore.ieee.org/abstract/document/11533369)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 📂 Repository Structure
 ```
-CGM-EEG/
+HSST-EEG/
 ├── models/                 # Model architectures
 │   ├── hsst.py               # Main model
 │   ├── tsception.py          # Ding, Yi, et al. (2022)
@@ -10,7 +12,7 @@ CGM-EEG/
 │   ├── sparcnet.py           # Jing, Jin, et al. (2023)
 │   ├── biot.py               # Yang, Chaoqi, et al. (2023)
 ├── dataset.py              # Dataset loading
-├── train.py                 # Main training script
+├── train.py                # Main training script
 ├── utils.py                # Utilities (e.g., metrics)
 ├── README.md               # This file
 ```
@@ -19,7 +21,7 @@ CGM-EEG/
 1. **Clone the repository**
 ```bash
    git clone https://github.com/emeelkaa/hsst_eeg.git
-   cd CGM-EEG
+   cd hsst-eeg
 ```
 
 2. **Create a virtual environment (recommended)**
@@ -28,12 +30,20 @@ CGM-EEG/
    source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-3. **Install dependencies**
+3. **Install PyTorch** (CUDA 12.1)
 ```bash
-   pip install -r requirements.txt
+pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 ```
-> **📌 Note:** For Mamba installation, please refer to the official repository:
-> [https://github.com/state-spaces/mamba](https://github.com/state-spaces/mamba)
+
+4. **Install Mamba**
+
+Follow the official instructions at [github.com/state-spaces/mamba](https://github.com/state-spaces/mamba). Both `mamba-ssm` and `causal-conv1d` must be built for your CUDA version.
+
+5. **Install remaining dependencies**
+```bash
+pip install -r requirements.txt
+```
+For dataset preprocessing please refer to: https://github.com/emeelkaa/cgm_eeg
 ## 📧 Contact
 
 For questions, issues, or collaboration inquiries, please contact:
