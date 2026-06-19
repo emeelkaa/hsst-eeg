@@ -42,3 +42,16 @@ For questions, issues, or collaboration inquiries, please contact:
 - **Author**: Emil Kim
 
 ---
+## 📚 Citation
+
+If you find our work helpful, please consider citing the following paper:
+
+```bibtex
+@article{kim2026hsst,
+  title={HSST-EEG: A Hybrid State-Space and Transformer Architecture for EEG Decoding},
+  author={Kim, Emil and Gahm, Jin Kyu},
+  journal={IEEE Access},
+  year={2026},
+  publisher={IEEE}
+}
+```
