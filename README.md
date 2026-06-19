@@ -1,5 +1,5 @@
 # 🧠 HSST-EEG [IEEE Access 2026]
-[![Paper](https://img.shields.io/badge/Access%202026)](https://ieeexplore.ieee.org/abstract/document/11533369)
+[![Paper](https://img.shields.io/badge/IEEE%20Access-2026-blue)](https://ieeexplore.ieee.org/abstract/document/11533369)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 📂 Repository Structure
