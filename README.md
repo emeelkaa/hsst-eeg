@@ -18,7 +18,7 @@ CGM-EEG/
 
 1. **Clone the repository**
 ```bash
-   git clone https://github.com/emeelkaa/cgm_eeg.git
+   git clone https://github.com/emeelkaa/hsst_eeg.git
    cd CGM-EEG
 ```
 
